@@ -1,1 +1,372 @@
 
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <title>Ordenar Bloques con Matrices en WebGL 2.0 </title>
+  <style>
+    body { font-family: sans-serif; text-align: center; }
+    canvas { border: 1px solid #ccc; background-color: #333; }
+  </style>
+</head>
+<body>
+  <h2>Ordenar Bloques: 4 Colores en 5 Tubos </h2>
+  <canvas id="webglcanvas" width="600" height="500"></canvas> 
+
+  <script id="vs" type="vertex">
+    #version 300 es
+    uniform mat4 uMatrizProyeccion;
+    uniform mat4 uMatrizModelo; 
+    layout(location = 0) in vec2 aVertices;
+    void main() {
+        /* Aplicación de las transformaciones */
+        gl_Position = uMatrizProyeccion * uMatrizModelo * vec4(aVertices, 0.0, 1.0);
+    }
+  </script>
+
+  <script id="fs" type="fragment">
+    #version 300 es
+    precision mediump float;
+    uniform vec4 uColor;
+    out vec4 color;
+    void main() {
+        color = uColor;
+    }
+  </script>
+
+  <script>
+    // --- UTILERÍAS DE MATRICES ---
+
+    /* Matriz Identidad */
+    function identidad(r) {
+        r[0] = 1; r[4] = 0; r[ 8] = 0; r[12] = 0;
+        r[1] = 0; r[5] = 1; r[ 9] = 0; r[13] = 0;
+        r[2] = 0; r[6] = 0; r[10] = 1; r[14] = 0;
+        r[3] = 0; r[7] = 0; r[11] = 0; r[15] = 1;
+    }
+
+    /* Proyección Ortográfica */
+    function ortho(r, izq, der, abj, arr, cerca, lejos) {
+        r[0] = 2/(der - izq); r[4] = 0; r[8] = 0; r[12] = -(der + izq)/(der - izq);
+        r[1] = 0; r[5] = 2/(arr - abj); r[9] = 0; r[13] = -(arr + abj)/(arr - abj);
+        r[2] = 0; r[6] = 0; r[10] = -2/(lejos - cerca); r[14] = -(lejos + cerca)/(lejos - cerca);
+        r[3] = 0; r[7] = 0; r[11] = 0; r[15] = 1;
+    }
+
+    /* Traslación (Modifica la matriz modelo) */
+    function traslacion(r, x, y, z) {
+        r[12] += r[0]*x + r[4]*y + r[8]*z;
+        r[13] += r[1]*x + r[5]*y + r[9]*z;
+        r[14] += r[2]*x + r[6]*y + r[10]*z;
+        r[15] += r[3]*x + r[7]*y + r[11]*z;
+    }
+
+    /* Escalación (Crea una matriz de escala) */
+    function escalacion(r, x, y, z) {
+        r[0] = x; r[4] = 0; r[8] = 0; r[12] = 0;
+        r[1] = 0; r[5] = y; r[9] = 0; r[13] = 0;
+        r[2] = 0; r[6] = 0; r[10] = z; r[14] = 0;
+        r[3] = 0; r[7] = 0; r[11] = 0; r[15] = 1;
+    }
+
+    /* Multiplicación de Matrices (A * B) */
+    function multiplicar(r, a, b) {
+      for(let i=0; i<4; i++) {
+        for(let j=0; j<4; j++) {
+          r[i*4+j] = a[j]*b[i*4+0] + a[j+4]*b[i*4+1] + a[j+8]*b[i*4+2] + a[j+12]*b[i*4+3];
+        }
+      }
+    }
+
+    // --- VARIABLES GLOBALES Y CONSTANTES ---
+    let gl, vao;
+    let uMatrizProyeccion, uColor, uMatrizModelo;
+
+    let MatrizProyeccion = new Float32Array(16);
+    let MatrizModelo = new Float32Array(16);
+    let MatrizEscala = new Float32Array(16);
+    let MatrizTraslacion = new Float32Array(16);
+
+    const MUNDO_IZQ = -6, MUNDO_DER = 6, MUNDO_ABJ = -5, MUNDO_ARR = 5; 
+    const LADO_BLOQUE = 1.0; 
+    const MAX_BLOQUES = 4; // Límite estructural de los tubos
+    const ANCHO_TUBO = LADO_BLOQUE + 0.2;
+    const ALTURA_TUBO = LADO_BLOQUE * MAX_BLOQUES + 0.1;
+
+    // 5 tubos
+    const POSICION_TUBOS_FINAL = [-4.0, -2.0, 0.0, 2.0, 4.0]; 
+    const BASE_Y = MUNDO_ABJ + LADO_BLOQUE / 2 + 0.1; 
+
+    // 4 colores
+    const COLORES = {
+      ROJO: [1, 0, 0, 1], 
+      VERDE: [0, 1, 0, 1], 
+      AZUL: [0, 0, 1, 1],
+      AMARILLO: [1, 1, 0, 1], 
+      GRIS: [0.2, 0.2, 0.2, 1] 
+    };
+
+    let estadoTubos = [
+      [COLORES.ROJO, COLORES.AZUL, COLORES.AZUL, COLORES.VERDE], 
+      [COLORES.VERDE, COLORES.AMARILLO, COLORES.ROJO, COLORES.AMARILLO], 
+      [COLORES.ROJO, COLORES.VERDE, COLORES.AMARILLO, COLORES.AZUL], 
+      [COLORES.AMARILLO, COLORES.VERDE, COLORES.AZUL, COLORES.ROJO], 
+      [] // Tubo 4 (vacío)
+    ];
+
+    let tuboSeleccionado = -1; 
+    let bloqueEnMovimiento = null; 
+    let animando = false;
+    
+    const VELOCIDAD_CAIDA_Y = -0.1; 
+    const VELOCIDAD_HORIZONTAL_X = 0.2; 
+
+    // --- LÓGICA DEL JUEGO (MODIFICADA) ---
+
+    function getPosicionYFinal(indiceBloque) {
+      return BASE_Y + (indiceBloque * LADO_BLOQUE);
+    }
+
+    function getPosicionBloque(indiceTubo, indiceBloque) {
+      const x = POSICION_TUBOS_FINAL[indiceTubo];
+      const y = getPosicionYFinal(indiceBloque);
+      return { x, y };
+    }
+
+    function getIndiceTuboPorCoordenadas(x_clip, y_clip) {
+        for (let i = 0; i < POSICION_TUBOS_FINAL.length; i++) {
+            const x_centro = POSICION_TUBOS_FINAL[i];
+            const x_min = x_centro - ANCHO_TUBO / 2;
+            const x_max = x_centro + ANCHO_TUBO / 2;
+            const y_min = MUNDO_ABJ; 
+            const y_max = MUNDO_ARR; 
+            if (x_clip >= x_min && x_clip <= x_max && y_clip >= y_min && y_clip <= y_max) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function intentarMoverBloque(destinoTubo) {
+      // Regla de movimiento inicial: No debe estar animando, debe haber un origen seleccionado y destino debe ser diferente.
+      if (animando || tuboSeleccionado === -1 || destinoTubo === tuboSeleccionado) return false;
+
+      const origenTubo = tuboSeleccionado;
+      const destinoPila = estadoTubos[destinoTubo];
+
+      // **ÚNICA REGLA DE VALIDACIÓN REQUERIDA (CAPACIDAD)**
+      // El tubo destino no debe estar estructuralmente lleno (MAX_BLOQUES).
+      if (destinoPila.length >= MAX_BLOQUES) return false;
+
+      // **MOVIMIENTO PERMITIDO (Reglas de color eliminadas)**
+      
+      // 1. Sacar el bloque de origen 
+      const color = estadoTubos[origenTubo].pop(); 
+
+      // 2. Definir posiciones de animación
+      const posInicial = getPosicionBloque(origenTubo, estadoTubos[origenTubo].length); 
+      const posFinal = getPosicionBloque(destinoTubo, destinoPila.length); 
+      
+      bloqueEnMovimiento = {
+          color: color,
+          x: posInicial.x,
+          y: posInicial.y + LADO_BLOQUE, 
+          destinoX: posFinal.x,
+          destinoY: posFinal.y,
+          fase: 'horizontal', 
+          destino: destinoTubo,
+      };
+
+      animando = true;
+      tuboSeleccionado = -1; 
+      return true;
+    }
+    
+    // El resto de la función handleClick, de animación y de dibujo se mantiene igual.
+
+    function handleClick(event) {
+      if (animando) return;
+
+      const rect = gl.canvas.getBoundingClientRect();
+      const x_pixel = event.clientX - rect.left;
+      const y_pixel = event.clientY - rect.top;
+
+      const x_mundo = MUNDO_IZQ + (x_pixel / gl.canvas.width) * (MUNDO_DER - MUNDO_IZQ);
+      const y_mundo = MUNDO_ARR - (y_pixel / gl.canvas.height) * (MUNDO_ARR - MUNDO_ABJ);
+
+      const tuboClickeado = getIndiceTuboPorCoordenadas(x_mundo, y_mundo);
+
+      if (tuboClickeado === -1) {
+        tuboSeleccionado = -1; 
+        return;
+      }
+      
+      if (tuboSeleccionado !== -1) {
+        intentarMoverBloque(tuboClickeado);
+      } 
+      else if (estadoTubos[tuboClickeado].length > 0) {
+        tuboSeleccionado = tuboClickeado;
+      }
+    }
+
+    // --- FUNCIONES DE DIBUJO CON MATRICES ---
+
+    function dibujarObjeto(color, x, y, ancho, alto) {
+      // 1. Crear Matriz de Escala (S)
+      escalacion(MatrizEscala, ancho / 2, alto / 2, 1); 
+
+      // 2. Crear Matriz de Traslación (T)
+      identidad(MatrizTraslacion);
+      traslacion(MatrizTraslacion, x, y, 0); 
+      
+      // 3. Componer Matriz Modelo: T * S
+      multiplicar(MatrizModelo, MatrizTraslacion, MatrizEscala); 
+
+      // 4. Pasar uniformes a WebGL
+      gl.uniformMatrix4fv(uMatrizModelo, false, MatrizModelo);
+      gl.uniform4fv(uColor, color);
+
+      gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+    }
+
+    function dibujarTubo(x_centro) {
+      const y_centro = MUNDO_ABJ + ALTURA_TUBO / 2;
+      dibujarObjeto(COLORES.GRIS, x_centro, y_centro, ANCHO_TUBO, ALTURA_TUBO);
+    }
+
+    function dibujarBloque(color, x, y, esSeleccionada) {
+      const y_offset = esSeleccionada ? 0.3 : 0; 
+      dibujarObjeto(color, x, y + y_offset, LADO_BLOQUE, LADO_BLOQUE);
+    }
+
+    function actualizarAnimacion() {
+      if (!animando || !bloqueEnMovimiento) return;
+
+      const bloque = bloqueEnMovimiento;
+
+      if (bloque.fase === 'horizontal') {
+          const dir = Math.sign(bloque.destinoX - bloque.x);
+          bloque.x += dir * VELOCIDAD_HORIZONTAL_X;
+
+          if ((dir > 0 && bloque.x >= bloque.destinoX) || (dir < 0 && bloque.x <= bloque.destinoX)) {
+              bloque.x = bloque.destinoX;
+              bloque.fase = 'caida';
+          }
+      }
+      
+      if (bloque.fase === 'caida') {
+          // Traslación continua hacia abajo (Gravedad simulada)
+          bloque.y += VELOCIDAD_CAIDA_Y;
+
+          // Detección de Colisión (Apilamiento)
+          if (bloque.y <= bloque.destinoY) {
+              bloque.y = bloque.destinoY; 
+              bloque.fase = 'terminado';
+          }
+      }
+
+      if (bloque.fase === 'terminado') {
+          // Finalizar la animación: Agregar el bloque de forma permanente
+          estadoTubos[bloque.destino].push(bloque.color);
+          animando = false;
+          bloqueEnMovimiento = null;
+      }
+    }
+
+    function dibujarEscena() {
+      actualizarAnimacion();
+
+      // 1. Dibujar los tubos (5 tubos)
+      for (const x of POSICION_TUBOS_FINAL) {
+        dibujarTubo(x);
+      }
+      
+      // 2. Dibujar bloques estáticos y en movimiento
+      for (let i = 0; i < estadoTubos.length; i++) {
+        const tubo = estadoTubos[i];
+        for (let j = 0; j < tubo.length; j++) {
+          const color = tubo[j];
+          const pos = getPosicionBloque(i, j);
+
+          const esSeleccionada = (i === tuboSeleccionado && j === tubo.length - 1);
+          
+          if (!esSeleccionada) {
+              dibujarBloque(color, pos.x, pos.y, false);
+          }
+        }
+      }
+      
+      // Dibujar bloque en movimiento
+      if (bloqueEnMovimiento) {
+          dibujarBloque(bloqueEnMovimiento.color, bloqueEnMovimiento.x, bloqueEnMovimiento.y, false);
+      } 
+      // Dibujar bloque seleccionado estático (levantado)
+      else if (tuboSeleccionado !== -1) {
+          const tubo = estadoTubos[tuboSeleccionado];
+          const color = tubo[tubo.length - 1];
+          const pos = getPosicionBloque(tuboSeleccionado, tubo.length - 1);
+          dibujarBloque(color, pos.x, pos.y, true); 
+      }
+    }
+
+    function dibuja() {
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindVertexArray(vao);
+      
+      dibujarEscena();
+
+      gl.bindVertexArray(null);
+      requestAnimationFrame(dibuja);
+    }
+
+    function main() {
+      const canvas = document.getElementById("webglcanvas");
+      gl = canvas.getContext("webgl2");
+      gl.viewport(0, 0, canvas.width, canvas.height);
+
+      // Shaders
+      function compileShader(type,srcId){
+        let s=gl.createShader(type);
+        gl.shaderSource(s, document.getElementById(srcId).text.trim());
+        gl.compileShader(s);
+        if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+        return s;
+      }
+      const vs = compileShader(gl.VERTEX_SHADER, "vs");
+      const fs = compileShader(gl.FRAGMENT_SHADER, "fs");
+
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+      gl.useProgram(prog);
+
+      // Geometría base: QUAD de -1 a 1 
+      const verts = new Float32Array([-1,-1, 1,-1, 1,1, -1,1]);
+      vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+      const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(0);
+      gl.bindVertexArray(null);
+
+      // Uniforms
+      uMatrizProyeccion = gl.getUniformLocation(prog, "uMatrizProyeccion");
+      uColor = gl.getUniformLocation(prog, "uColor");
+      uMatrizModelo = gl.getUniformLocation(prog, "uMatrizModelo");
+
+      // Proyección Ortográfica
+      ortho(MatrizProyeccion, MUNDO_IZQ, MUNDO_DER, MUNDO_ABJ, MUNDO_ARR, -1, 1);
+      gl.uniformMatrix4fv(uMatrizProyeccion, false, MatrizProyeccion);
+
+      gl.clearColor(0.2, 0.2, 0.3, 1.0); 
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      
+      canvas.addEventListener('click', handleClick);
+
+      dibuja();
+    }
+
+    window.onload = main;
+  </script>
+</body>
+</html>
